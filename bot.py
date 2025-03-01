@@ -5,6 +5,7 @@ import random
 import re
 from datetime import datetime
 from typing import List, Dict, Any, Set
+
 import aiohttp
 from bs4 import BeautifulSoup
 from dotenv import load_dotenv
@@ -25,7 +26,7 @@ logger = logging.getLogger(__name__)
 # Constants
 CHANNEL_LINK_PATTERN = r'^(?:https?://)?(?:t\.me|telegram\.me)/(?:joinchat/)?([a-zA-Z0-9_-]+)$'
 MAX_RETRIES = 3
-CONCURRENT_REPORTS = 10
+CONCURRENT_REPORTS = 5  # Reduced to avoid detection
 DEFAULT_TIMEOUT = 30
 REPORT_URL = "https://telegram.org/dsa-report"
 
@@ -43,11 +44,15 @@ SESSION_COOKIES = {
 # Browser-like Headers
 DEFAULT_HEADERS = {
     'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-    'Accept-Language': 'en-US,en;q=0.9',
-    'Accept-Encoding': 'gzip, deflate',
+    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
+    'Accept-Language': 'en-US,en;q=0.9,de;q=0.8',
+    'Accept-Encoding': 'gzip, deflate, br',
     'Connection': 'keep-alive',
     'Upgrade-Insecure-Requests': '1',
+    'Sec-Fetch-Dest': 'document',
+    'Sec-Fetch-Mode': 'navigate',
+    'Sec-Fetch-Site': 'same-origin',
+    'Sec-Fetch-User': '?1',
     'Cache-Control': 'no-cache',
     'Pragma': 'no-cache'
 }
@@ -169,13 +174,17 @@ class ReportBot:
                         csrf_token = self.get_next_token()
                         headers = self.prepare_headers(csrf_token)
                         
+                        # Prepare form data for DSA report
                         form_data = {
                             'csrf_token': csrf_token,
                             'csrfmiddlewaretoken': csrf_token,
-                            'channel': channel,
-                            'reason': random.choice(self.messages),
-                            'phone': phone_number,  # Add phone number to report
-                            'submit': 'Report Channel'
+                            'phone_number': phone_number,
+                            'channel_username': channel,
+                            'report_reason': random.choice(self.messages),
+                            'additional_details': f"Report from {phone_number}",
+                            'contact_allowed': 'true',
+                            'country_code': '+49' if phone_number.startswith('+49') else '+91',
+                            'submit_report': 'Submit Report'
                         }
 
                         async with session.post(
@@ -199,19 +208,21 @@ class ReportBot:
                             if success:
                                 logger.info(f"Successfully reported channel using number {phone_number}")
                                 self.phone_manager.mark_number_status(phone_number, True)
+                                # Add delay between successful reports
+                                await asyncio.sleep(random.uniform(1.5, 3.0))
                                 return True
                             
                             if attempt < 1:
-                                await asyncio.sleep(1)
+                                await asyncio.sleep(random.uniform(2.0, 4.0))
                                 continue
                             
-                            logger.error(f"Failed to report channel. Status: {response.status}")
+                            logger.error(f"Failed to report channel with number {phone_number}. Status: {response.status}")
                             self.phone_manager.mark_number_status(phone_number, False)
                             return False
 
                     except asyncio.TimeoutError:
                         if attempt < 1:
-                            await asyncio.sleep(1)
+                            await asyncio.sleep(2)
                             continue
                         logger.error(f"Timeout with number {phone_number}")
                         self.phone_manager.mark_number_status(phone_number, False)
@@ -219,7 +230,7 @@ class ReportBot:
                     
                     except Exception as e:
                         if attempt < 1:
-                            await asyncio.sleep(1)
+                            await asyncio.sleep(2)
                             continue
                         logger.error(f"Error with number {phone_number}: {str(e)}")
                         self.phone_manager.mark_number_status(phone_number, False)
@@ -279,6 +290,8 @@ class ReportBot:
                             raise asyncio.CancelledError()
                         # Get a new number for retry
                         phone_number = self.phone_manager.get_phone_number()
+                        # Add delay between retries
+                        await asyncio.sleep(random.uniform(1.0, 2.0))
                     return False
             except asyncio.CancelledError:
                 logger.info(f"Report task cancelled for user {user_id}")
