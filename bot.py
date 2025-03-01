@@ -42,6 +42,18 @@ SESSION_COOKIES = {
     'sessionid': 'jcl1bqxzby1c8pspe592y5ub55x01scm'
 }
 
+# Browser-like Headers
+DEFAULT_HEADERS = {
+    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+    'Accept-Language': 'en-US,en;q=0.9',
+    'Accept-Encoding': 'gzip, deflate',
+    'Connection': 'keep-alive',
+    'Upgrade-Insecure-Requests': '1',
+    'Cache-Control': 'no-cache',
+    'Pragma': 'no-cache'
+}
+
 class ProxyManager:
     def __init__(self):
         self.proxies = self.load_proxies()
@@ -54,7 +66,16 @@ class ProxyManager:
         """Load and validate proxies from http_proxies.txt"""
         try:
             with open('http_proxies.txt', 'r') as f:
-                return [line.strip() for line in f if line.strip() and not line.startswith('#')]
+                proxies = []
+                for line in f:
+                    line = line.strip()
+                    if not line or line.startswith('#'):
+                        continue
+                    # Add protocol if missing
+                    if not any(line.startswith(p) for p in ['http://', 'socks4://', 'socks5://']):
+                        line = 'http://' + line
+                    proxies.append(line)
+                return proxies
         except FileNotFoundError:
             logger.error("http_proxies.txt not found!")
             return []
@@ -86,16 +107,6 @@ class ReportBot:
         self.messages = self.load_messages()
         self.active_tasks: Dict[int, Dict[str, Any]] = {}
         self.current_token_index = 0
-        self.session_headers = {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
-            'Accept-Language': 'en-US,en;q=0.9',
-            'Accept-Encoding': 'gzip, deflate, br',
-            'Connection': 'keep-alive',
-            'Upgrade-Insecure-Requests': '1',
-            'Origin': 'https://telegram.org',
-            'Referer': REPORT_URL
-        }
 
     @staticmethod
     def load_messages() -> List[str]:
@@ -114,6 +125,19 @@ class ReportBot:
         self.current_token_index = (self.current_token_index + 1) % len(tokens)
         return token
 
+    def prepare_headers(self, csrf_token: str) -> Dict[str, str]:
+        """Prepare headers for the request"""
+        headers = DEFAULT_HEADERS.copy()
+        headers.update({
+            'Content-Type': 'application/x-www-form-urlencoded',
+            'Origin': 'https://telegram.org',
+            'Referer': REPORT_URL,
+            'X-CSRF-Token': csrf_token,
+            'X-CSRFToken': csrf_token,
+            'Cookie': f'csrftoken={csrf_token}; sessionid={SESSION_COOKIES["sessionid"]}'
+        })
+        return headers
+
     async def report_with_proxy(self, channel: str, proxy: str, user_id: int) -> bool:
         """Submit a report using a specific proxy"""
         try:
@@ -121,13 +145,8 @@ class ReportBot:
                 logger.info(f"Task cancelled for user {user_id}")
                 return False
 
-            # Validate proxy format
-            if not any(proxy.startswith(prefix) for prefix in ['http://', 'socks4://', 'socks5://']):
-                logger.error(f"Invalid proxy format: {proxy}")
-                return False
-
             # Configure timeout and connector
-            timeout = aiohttp.ClientTimeout(total=20, connect=10)
+            timeout = aiohttp.ClientTimeout(total=30, connect=10)
             connector = ProxyConnector.from_url(proxy, verify_ssl=False, force_close=True)
             
             async with aiohttp.ClientSession(
@@ -136,58 +155,67 @@ class ReportBot:
                 cookie_jar=aiohttp.CookieJar(),
                 trust_env=True
             ) as session:
-                # Set session cookies
-                session.cookie_jar.update_cookies(SESSION_COOKIES)
+                # Submit report with retry mechanism
+                for attempt in range(2):
+                    try:
+                        # Get fresh CSRF token for each attempt
+                        csrf_token = self.get_next_token()
+                        headers = self.prepare_headers(csrf_token)
+                        
+                        form_data = {
+                            'csrf_token': csrf_token,
+                            'csrfmiddlewaretoken': csrf_token,
+                            'channel': channel,
+                            'reason': random.choice(self.messages),
+                            'submit': 'Report Channel'
+                        }
 
-                # Test proxy connection first
-                try:
-                    async with session.get('https://api.telegram.org', ssl=False) as test_response:
-                        if test_response.status != 200:
-                            logger.error(f"Proxy test failed: {proxy}")
+                        async with session.post(
+                            REPORT_URL,
+                            headers=headers,
+                            data=form_data,
+                            allow_redirects=True,
+                            ssl=False,
+                            timeout=aiohttp.ClientTimeout(total=15)
+                        ) as response:
+                            response_text = await response.text()
+                            
+                            # Check for successful report indicators
+                            success = (
+                                response.status == 200 and
+                                ('report has been sent' in response_text.lower() or
+                                'thank you' in response_text.lower() or
+                                'report received' in response_text.lower())
+                            )
+                            
+                            if success:
+                                logger.info(f"Successfully reported channel using proxy {proxy}")
+                                self.proxy_manager.mark_proxy_status(proxy, True)
+                                return True
+                            
+                            if attempt < 1:
+                                await asyncio.sleep(1)
+                                continue
+                            
+                            logger.error(f"Failed to report channel. Status: {response.status}")
+                            self.proxy_manager.mark_proxy_status(proxy, False)
                             return False
-                except Exception as e:
-                    logger.error(f"Proxy connection test failed: {proxy} - {str(e)}")
-                    return False
 
-                if user_id in self.active_tasks and self.active_tasks[user_id].get('cancelled', False):
-                    return False
-
-                # Get CSRF token
-                csrf_token = self.get_next_token()
-
-                # Prepare report data
-                headers = self.session_headers.copy()
-                headers.update({
-                    'Content-Type': 'application/x-www-form-urlencoded',
-                    'X-CSRF-Token': csrf_token,
-                    'X-CSRFToken': csrf_token,
-                    'Cookie': f'csrftoken={csrf_token}; sessionid={SESSION_COOKIES["sessionid"]}'
-                })
-                
-                form_data = {
-                    'csrf_token': csrf_token,
-                    'csrfmiddlewaretoken': csrf_token,
-                    'channel': channel,
-                    'reason': random.choice(self.messages),
-                    'submit': 'Report Channel'
-                }
-
-                # Submit report
-                async with session.post(
-                    REPORT_URL,
-                    headers=headers,
-                    data=form_data,
-                    allow_redirects=True,
-                    ssl=False
-                ) as response:
-                    response_text = await response.text()
-                    success = response.status == 200 and ('report has been sent' in response_text.lower() or 'thank you' in response_text.lower())
-                    if success:
-                        logger.info(f"Successfully reported channel using proxy {proxy}")
-                    else:
-                        logger.error(f"Failed to report channel. Status: {response.status}, Response: {response_text[:200]}")
-                    self.proxy_manager.mark_proxy_status(proxy, success)
-                    return success
+                    except asyncio.TimeoutError:
+                        if attempt < 1:
+                            await asyncio.sleep(1)
+                            continue
+                        logger.error(f"Timeout with proxy {proxy}")
+                        self.proxy_manager.mark_proxy_status(proxy, False)
+                        return False
+                    
+                    except Exception as e:
+                        if attempt < 1:
+                            await asyncio.sleep(1)
+                            continue
+                        logger.error(f"Error with proxy {proxy}: {str(e)}")
+                        self.proxy_manager.mark_proxy_status(proxy, False)
+                        return False
 
         except Exception as e:
             logger.error(f"Error with proxy {proxy}: {str(e)}")
@@ -241,6 +269,8 @@ class ReportBot:
                             return True
                         if self.active_tasks[user_id].get('cancelled', False):
                             raise asyncio.CancelledError()
+                        # Get a new proxy for retry
+                        proxy = self.proxy_manager.get_proxy()
                     return False
             except asyncio.CancelledError:
                 logger.info(f"Report task cancelled for user {user_id}")
