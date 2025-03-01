@@ -5,9 +5,7 @@ import random
 import re
 from datetime import datetime
 from typing import List, Dict, Any, Set
-
 import aiohttp
-from aiohttp_socks import ProxyConnector
 from bs4 import BeautifulSoup
 from dotenv import load_dotenv
 from telegram import Update
@@ -54,56 +52,67 @@ DEFAULT_HEADERS = {
     'Pragma': 'no-cache'
 }
 
-class ProxyManager:
+class PhoneNumberManager:
     def __init__(self):
-        self.proxies = self.load_proxies()
-        self.working_proxies = set()
-        self.failed_proxies = set()
+        self.phone_numbers = self.load_phone_numbers()
+        self.working_numbers = set()
+        self.failed_numbers = set()
         self.current_index = 0
 
     @staticmethod
-    def load_proxies() -> List[str]:
-        """Load and validate proxies from http_proxies.txt"""
+    def is_valid_number(number: str) -> bool:
+        """Check if the phone number is valid German or Indian"""
+        return bool(re.match(r'^\+(?:49|91)\d{10,12}$', number))
+
+    def load_phone_numbers(self) -> List[str]:
+        """Load phone numbers from phone_numbers.txt"""
         try:
-            with open('http_proxies.txt', 'r') as f:
-                proxies = []
+            with open('phone_numbers.txt', 'r') as f:
+                numbers = []
                 for line in f:
                     line = line.strip()
                     if not line or line.startswith('#'):
                         continue
-                    # Add protocol if missing
-                    if not any(line.startswith(p) for p in ['http://', 'socks4://', 'socks5://']):
-                        line = 'http://' + line
-                    proxies.append(line)
-                return proxies
+                    if self.is_valid_number(line):
+                        numbers.append(line)
+                        logger.info(f"Added phone number: {line}")
+                    else:
+                        logger.debug(f"Invalid phone number format: {line}")
+                
+                if not numbers:
+                    logger.warning("No valid phone numbers found in phone_numbers.txt!")
+                else:
+                    logger.info(f"Loaded {len(numbers)} phone numbers")
+                return numbers
         except FileNotFoundError:
-            logger.error("http_proxies.txt not found!")
+            logger.error("phone_numbers.txt not found!")
             return []
 
-    def get_proxy(self) -> str:
-        """Get a working proxy, preferably from the working_proxies set"""
-        if self.working_proxies:
-            return random.choice(list(self.working_proxies))
-        if not self.proxies:
+    def get_phone_number(self) -> str:
+        """Get a working phone number"""
+        if self.working_numbers:
+            return random.choice(list(self.working_numbers))
+        if not self.phone_numbers:
+            logger.error("No phone numbers available!")
             return ""
         
         # Round-robin selection
-        proxy = self.proxies[self.current_index]
-        self.current_index = (self.current_index + 1) % len(self.proxies)
-        return proxy
+        number = self.phone_numbers[self.current_index]
+        self.current_index = (self.current_index + 1) % len(self.phone_numbers)
+        return number
 
-    def mark_proxy_status(self, proxy: str, success: bool):
-        """Mark proxy as working or failed"""
+    def mark_number_status(self, number: str, success: bool):
+        """Mark phone number as working or failed"""
         if success:
-            self.working_proxies.add(proxy)
-            self.failed_proxies.discard(proxy)
+            self.working_numbers.add(number)
+            self.failed_numbers.discard(number)
         else:
-            self.failed_proxies.add(proxy)
-            self.working_proxies.discard(proxy)
+            self.failed_numbers.add(number)
+            self.working_numbers.discard(number)
 
 class ReportBot:
     def __init__(self):
-        self.proxy_manager = ProxyManager()
+        self.phone_manager = PhoneNumberManager()
         self.messages = self.load_messages()
         self.active_tasks: Dict[int, Dict[str, Any]] = {}
         self.current_token_index = 0
@@ -138,19 +147,17 @@ class ReportBot:
         })
         return headers
 
-    async def report_with_proxy(self, channel: str, proxy: str, user_id: int) -> bool:
-        """Submit a report using a specific proxy"""
+    async def report_with_number(self, channel: str, phone_number: str, user_id: int) -> bool:
+        """Submit a report using a specific phone number"""
         try:
             if user_id in self.active_tasks and self.active_tasks[user_id].get('cancelled', False):
                 logger.info(f"Task cancelled for user {user_id}")
                 return False
 
-            # Configure timeout and connector
+            # Configure timeout
             timeout = aiohttp.ClientTimeout(total=30, connect=10)
-            connector = ProxyConnector.from_url(proxy, verify_ssl=False, force_close=True)
             
             async with aiohttp.ClientSession(
-                connector=connector,
                 timeout=timeout,
                 cookie_jar=aiohttp.CookieJar(),
                 trust_env=True
@@ -167,6 +174,7 @@ class ReportBot:
                             'csrfmiddlewaretoken': csrf_token,
                             'channel': channel,
                             'reason': random.choice(self.messages),
+                            'phone': phone_number,  # Add phone number to report
                             'submit': 'Report Channel'
                         }
 
@@ -189,8 +197,8 @@ class ReportBot:
                             )
                             
                             if success:
-                                logger.info(f"Successfully reported channel using proxy {proxy}")
-                                self.proxy_manager.mark_proxy_status(proxy, True)
+                                logger.info(f"Successfully reported channel using number {phone_number}")
+                                self.phone_manager.mark_number_status(phone_number, True)
                                 return True
                             
                             if attempt < 1:
@@ -198,28 +206,28 @@ class ReportBot:
                                 continue
                             
                             logger.error(f"Failed to report channel. Status: {response.status}")
-                            self.proxy_manager.mark_proxy_status(proxy, False)
+                            self.phone_manager.mark_number_status(phone_number, False)
                             return False
 
                     except asyncio.TimeoutError:
                         if attempt < 1:
                             await asyncio.sleep(1)
                             continue
-                        logger.error(f"Timeout with proxy {proxy}")
-                        self.proxy_manager.mark_proxy_status(proxy, False)
+                        logger.error(f"Timeout with number {phone_number}")
+                        self.phone_manager.mark_number_status(phone_number, False)
                         return False
                     
                     except Exception as e:
                         if attempt < 1:
                             await asyncio.sleep(1)
                             continue
-                        logger.error(f"Error with proxy {proxy}: {str(e)}")
-                        self.proxy_manager.mark_proxy_status(proxy, False)
+                        logger.error(f"Error with number {phone_number}: {str(e)}")
+                        self.phone_manager.mark_number_status(phone_number, False)
                         return False
 
         except Exception as e:
-            logger.error(f"Error with proxy {proxy}: {str(e)}")
-            self.proxy_manager.mark_proxy_status(proxy, False)
+            logger.error(f"Error with number {phone_number}: {str(e)}")
+            self.phone_manager.mark_number_status(phone_number, False)
             return False
 
     def cancel_user_tasks(self, user_id: int) -> int:
@@ -240,9 +248,9 @@ class ReportBot:
         return cancelled
 
     async def mass_report(self, channel: str, user_id: int, num_reports: int = 50) -> str:
-        """Send multiple reports using different proxies"""
-        if not self.proxy_manager.proxies:
-            return "No proxies available! Please add proxies to http_proxies.txt"
+        """Send multiple reports using different phone numbers"""
+        if not self.phone_manager.phone_numbers:
+            return "No phone numbers available! Please add numbers to phone_numbers.txt"
 
         if user_id in self.active_tasks and self.active_tasks[user_id].get('tasks'):
             return "You already have an active reporting process. Use /cancel to stop it first."
@@ -263,14 +271,14 @@ class ReportBot:
                     if self.active_tasks[user_id].get('cancelled', False):
                         raise asyncio.CancelledError()
                     
-                    proxy = self.proxy_manager.get_proxy()
+                    phone_number = self.phone_manager.get_phone_number()
                     for _ in range(MAX_RETRIES):
-                        if await self.report_with_proxy(channel, proxy, user_id):
+                        if await self.report_with_number(channel, phone_number, user_id):
                             return True
                         if self.active_tasks[user_id].get('cancelled', False):
                             raise asyncio.CancelledError()
-                        # Get a new proxy for retry
-                        proxy = self.proxy_manager.get_proxy()
+                        # Get a new number for retry
+                        phone_number = self.phone_manager.get_phone_number()
                     return False
             except asyncio.CancelledError:
                 logger.info(f"Report task cancelled for user {user_id}")
@@ -305,7 +313,7 @@ class ReportBot:
                 status += f"📈 Success Rate: {success_rate:.1f}%\n"
 
             status += (
-                f"🔄 Working Proxies: {len(self.proxy_manager.working_proxies)}\n"
+                f"🔄 Working Numbers: {len(self.phone_manager.working_numbers)}\n"
                 f"⏱ Duration: {duration.seconds}s"
             )
             return status
