@@ -9,7 +9,7 @@ import random
 import asyncio
 from datetime import datetime
 
-# Load environment variables
+# Load environment variables - only load .env if not in production (Heroku)
 if os.path.exists('.env'):
     load_dotenv()
 
@@ -23,6 +23,55 @@ logger = logging.getLogger(__name__)
 # Regular expression for Telegram channel links
 CHANNEL_LINK_PATTERN = r'^(?:https?://)?(?:t\.me|telegram\.me)/(?:joinchat/)?([a-zA-Z0-9_-]+)$'
 
+# Command handler functions
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Send a message when the command /start is issued."""
+    user = update.effective_user
+    await update.message.reply_html(
+        f"Hi {user.mention_html()}! 👋\n\n"
+        "I'm your friendly Telegram bot. Here are the commands you can use:\n"
+        "/start - Show this welcome message\n"
+        "/help - Show available commands\n"
+        "/echo [message] - Echo back your message\n"
+        "/time - Get current time\n"
+        "/report [channel_link] - Report a Telegram channel"
+    )
+
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Send a message when the command /help is issued."""
+    help_text = (
+        "Here are the available commands:\n\n"
+        "/start - Start the bot\n"
+        "/help - Show this help message\n"
+        "/echo [message] - Echo back your message\n"
+        "/time - Get current time\n"
+        "/report [channel_link] - Report a Telegram channel\n\n"
+        "For reporting, use format:\n"
+        "/report https://t.me/channelname"
+    )
+    await update.message.reply_text(help_text)
+
+async def echo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Echo the user message."""
+    if not context.args:
+        await update.message.reply_text("Please provide a message to echo!\nUsage: /echo [message]")
+        return
+    
+    message = ' '.join(context.args)
+    await update.message.reply_text(f"You said: {message}")
+
+async def time_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Send current time."""
+    current_time = datetime.now().strftime("%H:%M:%S")
+    await update.message.reply_text(f"Current time is: {current_time}")
+
+async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle all non-command messages."""
+    await update.message.reply_text(
+        "I can respond to commands! Try /help to see what I can do."
+    )
+
+# Utility functions
 def load_proxies():
     """Load proxies from http_proxies.txt"""
     try:
@@ -41,24 +90,35 @@ def load_messages():
         logger.error("message.txt not found!")
         return ["This channel violates Telegram's terms of service"]
 
+# Reporting functions
 async def report_with_proxy(session, channel, reason, proxy):
     """Report channel using a specific proxy"""
     try:
         report_url = "https://telegram.org/dsa-report"
         headers = {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+            'Accept-Language': 'en-US,en;q=0.5',
+            'Content-Type': 'application/x-www-form-urlencoded',
+            'Origin': 'https://telegram.org',
+            'Connection': 'keep-alive',
+            'Referer': 'https://telegram.org/dsa-report'
         }
         
         proxy_url = f"http://{proxy}"
         
+        form_data = {
+            'channel': channel,
+            'reason': reason,
+            'submit': 'Report Channel'
+        }
+        
         async with session.post(report_url, 
                               proxy=proxy_url,
                               headers=headers,
-                              data={
-                                  'channel': channel,
-                                  'reason': reason
-                              },
-                              timeout=30) as response:
+                              data=form_data,
+                              timeout=30,
+                              ssl=False) as response:
             return response.status == 200
     except Exception as e:
         logger.error(f"Error with proxy {proxy}: {str(e)}")
@@ -75,6 +135,8 @@ async def mass_report(channel_username, num_reports=50):
         return "No messages found in message.txt!"
     
     successful_reports = 0
+    failed_reports = 0
+    
     async with aiohttp.ClientSession() as session:
         tasks = []
         for _ in range(num_reports):
@@ -83,9 +145,16 @@ async def mass_report(channel_username, num_reports=50):
             tasks.append(report_with_proxy(session, channel_username, reason, proxy))
             
         results = await asyncio.gather(*tasks, return_exceptions=True)
-        successful_reports = sum(1 for r in results if r is True)
+        for result in results:
+            if isinstance(result, bool) and result:
+                successful_reports += 1
+            else:
+                failed_reports += 1
     
-    return f"Completed reporting process:\n✅ Successful reports: {successful_reports}\n❌ Failed reports: {num_reports - successful_reports}"
+    return (f"Completed reporting process:\n"
+            f"✅ Successful reports: {successful_reports}\n"
+            f"❌ Failed reports: {failed_reports}\n"
+            f"📊 Success rate: {(successful_reports/num_reports)*100:.1f}%")
 
 async def report_channel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle channel reporting."""
@@ -112,7 +181,10 @@ async def report_channel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         channel_username = re.search(CHANNEL_LINK_PATTERN, channel_link).group(1)
         
         # Send initial message
-        status_message = await update.message.reply_text("🚀 Starting mass report process...")
+        status_message = await update.message.reply_text(
+            "🚀 Starting mass report process...\n"
+            "⏳ This may take a few minutes. Please wait..."
+        )
         
         # Start mass reporting
         result = await mass_report(channel_username)
@@ -130,15 +202,15 @@ async def report_channel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         )
         return
 
-# [Keep other existing functions: start, help_command, echo, time_command, handle_message]
-
 def main() -> None:
     """Start the bot."""
+    # Get token from environment variable
     token = os.getenv("TELEGRAM_BOT_TOKEN")
     if not token:
         logger.error("No bot token found! Make sure TELEGRAM_BOT_TOKEN environment variable is set")
         return
 
+    # Create the Application and pass it your bot's token
     application = Application.builder().token(token).build()
 
     # Add command handlers
