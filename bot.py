@@ -36,6 +36,7 @@ class ProxyManager:
         self.proxies = self.load_proxies()
         self.working_proxies = set()
         self.failed_proxies = set()
+        self.current_index = 0
 
     @staticmethod
     def load_proxies() -> List[str]:
@@ -51,7 +52,13 @@ class ProxyManager:
         """Get a working proxy, preferably from the working_proxies set"""
         if self.working_proxies:
             return random.choice(list(self.working_proxies))
-        return random.choice(self.proxies) if self.proxies else ""
+        if not self.proxies:
+            return ""
+        
+        # Round-robin selection
+        proxy = self.proxies[self.current_index]
+        self.current_index = (self.current_index + 1) % len(self.proxies)
+        return proxy
 
     def mark_proxy_status(self, proxy: str, success: bool):
         """Mark proxy as working or failed"""
@@ -66,7 +73,7 @@ class ReportBot:
     def __init__(self):
         self.proxy_manager = ProxyManager()
         self.messages = self.load_messages()
-        self.active_tasks: Dict[int, Set[asyncio.Task]] = {}
+        self.active_tasks: Dict[int, Dict[str, Any]] = {}
         self.session_headers = {
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
             'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
@@ -94,7 +101,8 @@ class ReportBot:
             'Sec-Fetch-Mode': 'navigate',
             'Sec-Fetch-Site': 'none',
             'Sec-Fetch-User': '?1',
-            'Cache-Control': 'max-age=0'
+            'Cache-Control': 'no-cache',
+            'Pragma': 'no-cache'
         })
 
         for attempt in range(3):  # Try 3 times
@@ -102,27 +110,51 @@ class ReportBot:
                 async with session.get(
                     REPORT_URL,
                     headers=headers,
-                    timeout=DEFAULT_TIMEOUT,
+                    timeout=aiohttp.ClientTimeout(total=15),
                     allow_redirects=True,
                     ssl=False
                 ) as response:
                     if response.status != 200:
-                        logger.error(f"Failed to get CSRF token. Status: {response.status}")
+                        logger.error(f"Failed to get CSRF token. Status: {response.status}, URL: {response.url}")
+                        await asyncio.sleep(1)
                         continue
 
                     text = await response.text()
                     if not text:
                         logger.error("Empty response received from report page")
+                        await asyncio.sleep(1)
                         continue
 
+                    # Try different patterns to find the CSRF token
                     soup = BeautifulSoup(text, 'html.parser')
-                    token = soup.find('input', {'name': 'csrf_token'})
                     
-                    if not token or not token.get('value'):
-                        logger.error("No CSRF token found in the page")
-                        continue
+                    # Try method 1: Direct input field
+                    token = soup.find('input', {'name': 'csrf_token'})
+                    if token and token.get('value'):
+                        return token['value']
+                    
+                    # Try method 2: Meta tag
+                    meta_token = soup.find('meta', {'name': 'csrf-token'})
+                    if meta_token and meta_token.get('content'):
+                        return meta_token['content']
+                    
+                    # Try method 3: Data attribute
+                    data_token = soup.find(attrs={'data-csrf': True})
+                    if data_token and data_token.get('data-csrf'):
+                        return data_token['data-csrf']
 
-                    return token['value']
+                    # Try method 4: Parse from script tags
+                    scripts = soup.find_all('script')
+                    for script in scripts:
+                        if script.string and 'csrf' in script.string.lower():
+                            import re
+                            csrf_match = re.search(r'csrf[_-]token["\']?\s*[:=]\s*["\']([^"\']+)', script.string, re.I)
+                            if csrf_match:
+                                return csrf_match.group(1)
+
+                    logger.error(f"No CSRF token found in the page. Response length: {len(text)}")
+                    logger.debug(f"Page content preview: {text[:500]}")
+                    await asyncio.sleep(1)
 
             except asyncio.TimeoutError:
                 logger.error(f"Timeout while getting CSRF token (attempt {attempt + 1}/3)")
@@ -131,25 +163,52 @@ class ReportBot:
             except Exception as e:
                 logger.error(f"Unexpected error while getting CSRF token: {str(e)} (attempt {attempt + 1}/3)")
             
-            await asyncio.sleep(1)  # Wait before retry
+            await asyncio.sleep(2)
         
         return ""
 
-    async def report_with_proxy(self, channel: str, proxy: str) -> bool:
+    async def report_with_proxy(self, channel: str, proxy: str, user_id: int) -> bool:
         """Submit a report using a specific proxy"""
         try:
-            connector = ProxyConnector.from_url(proxy, verify_ssl=False)
-            timeout = aiohttp.ClientTimeout(total=DEFAULT_TIMEOUT)
+            if user_id in self.active_tasks and self.active_tasks[user_id].get('cancelled', False):
+                logger.info(f"Task cancelled for user {user_id}")
+                return False
+
+            # Validate proxy format
+            if not any(proxy.startswith(prefix) for prefix in ['http://', 'socks4://', 'socks5://']):
+                logger.error(f"Invalid proxy format: {proxy}")
+                return False
+
+            # Configure timeout and connector
+            timeout = aiohttp.ClientTimeout(total=20, connect=10)
+            connector = ProxyConnector.from_url(proxy, verify_ssl=False, force_close=True)
             
             async with aiohttp.ClientSession(
                 connector=connector,
                 timeout=timeout,
-                cookie_jar=aiohttp.CookieJar()
+                cookie_jar=aiohttp.CookieJar(),
+                trust_env=True
             ) as session:
+                # Test proxy connection first
+                try:
+                    async with session.get('https://api.telegram.org', ssl=False) as test_response:
+                        if test_response.status != 200:
+                            logger.error(f"Proxy test failed: {proxy}")
+                            return False
+                except Exception as e:
+                    logger.error(f"Proxy connection test failed: {proxy} - {str(e)}")
+                    return False
+
+                if user_id in self.active_tasks and self.active_tasks[user_id].get('cancelled', False):
+                    return False
+
                 # Get CSRF token
                 csrf_token = await self.get_csrf_token(session)
                 if not csrf_token:
                     logger.error(f"Failed to get CSRF token with proxy {proxy}")
+                    return False
+
+                if user_id in self.active_tasks and self.active_tasks[user_id].get('cancelled', False):
                     return False
 
                 # Prepare report data
@@ -157,7 +216,8 @@ class ReportBot:
                 headers.update({
                     'Content-Type': 'application/x-www-form-urlencoded',
                     'Origin': 'https://telegram.org',
-                    'Referer': REPORT_URL
+                    'Referer': REPORT_URL,
+                    'X-CSRF-Token': csrf_token
                 })
                 
                 form_data = {
@@ -193,14 +253,17 @@ class ReportBot:
         """Cancel all active tasks for a user"""
         if user_id not in self.active_tasks:
             return 0
+
+        # Mark as cancelled
+        self.active_tasks[user_id]['cancelled'] = True
         
+        # Cancel all tasks
         cancelled = 0
-        for task in self.active_tasks[user_id]:
+        for task in self.active_tasks[user_id].get('tasks', set()):
             if not task.done():
                 task.cancel()
                 cancelled += 1
-        
-        self.active_tasks[user_id].clear()
+
         return cancelled
 
     async def mass_report(self, channel: str, user_id: int, num_reports: int = 50) -> str:
@@ -208,21 +271,31 @@ class ReportBot:
         if not self.proxy_manager.proxies:
             return "No proxies available! Please add proxies to http_proxies.txt"
 
-        if user_id in self.active_tasks and self.active_tasks[user_id]:
+        if user_id in self.active_tasks and self.active_tasks[user_id].get('tasks'):
             return "You already have an active reporting process. Use /cancel to stop it first."
+
+        self.active_tasks[user_id] = {
+            'tasks': set(),
+            'cancelled': False,
+            'start_time': datetime.now()
+        }
 
         successful_reports = 0
         failed_reports = 0
         semaphore = asyncio.Semaphore(CONCURRENT_REPORTS)
-        self.active_tasks[user_id] = set()
 
         async def report_with_semaphore():
             try:
                 async with semaphore:
+                    if self.active_tasks[user_id].get('cancelled', False):
+                        raise asyncio.CancelledError()
+                    
                     proxy = self.proxy_manager.get_proxy()
                     for _ in range(MAX_RETRIES):
-                        if await self.report_with_proxy(channel, proxy):
+                        if await self.report_with_proxy(channel, proxy, user_id):
                             return True
+                        if self.active_tasks[user_id].get('cancelled', False):
+                            raise asyncio.CancelledError()
                     return False
             except asyncio.CancelledError:
                 logger.info(f"Report task cancelled for user {user_id}")
@@ -233,7 +306,7 @@ class ReportBot:
 
         try:
             tasks = [asyncio.create_task(report_with_semaphore()) for _ in range(num_reports)]
-            self.active_tasks[user_id].update(tasks)
+            self.active_tasks[user_id]['tasks'].update(tasks)
             
             results = await asyncio.gather(*tasks, return_exceptions=True)
             
@@ -241,6 +314,8 @@ class ReportBot:
             failed_reports = sum(1 for r in results if r is False)
             cancelled_reports = sum(1 for r in results if isinstance(r, asyncio.CancelledError))
 
+            duration = datetime.now() - self.active_tasks[user_id]['start_time']
+            
             status = (
                 f"📊 Report Results:\n"
                 f"✅ Successful: {successful_reports}\n"
@@ -254,11 +329,15 @@ class ReportBot:
                 success_rate = (successful_reports/(successful_reports + failed_reports))*100
                 status += f"📈 Success Rate: {success_rate:.1f}%\n"
 
-            status += f"🔄 Working Proxies: {len(self.proxy_manager.working_proxies)}"
+            status += (
+                f"🔄 Working Proxies: {len(self.proxy_manager.working_proxies)}\n"
+                f"⏱ Duration: {duration.seconds}s"
+            )
             return status
 
         finally:
-            self.active_tasks[user_id].clear()
+            self.active_tasks[user_id]['tasks'].clear()
+            self.active_tasks[user_id]['cancelled'] = False
 
 # Initialize the bot
 report_bot = ReportBot()
