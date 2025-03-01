@@ -31,6 +31,17 @@ CONCURRENT_REPORTS = 10
 DEFAULT_TIMEOUT = 30
 REPORT_URL = "https://telegram.org/dsa-report"
 
+# CSRF Token Configuration
+CSRF_TOKENS = {
+    'token1': "FT6Vp2oJrLLct9xB3VvtQHFr1UNWPHfntUaPTc1WHMP0ITJqbxuPj1iVubuchpv3",
+    'token2': "W2L71Ern1tYEOKcaSXQfsD0eBYcsf1Pr5yhMYnASmuSs921xJR86Qtn0pZeeKi2N"
+}
+
+SESSION_COOKIES = {
+    'csrftoken': CSRF_TOKENS['token1'],
+    'sessionid': 'jcl1bqxzby1c8pspe592y5ub55x01scm'
+}
+
 class ProxyManager:
     def __init__(self):
         self.proxies = self.load_proxies()
@@ -74,13 +85,16 @@ class ReportBot:
         self.proxy_manager = ProxyManager()
         self.messages = self.load_messages()
         self.active_tasks: Dict[int, Dict[str, Any]] = {}
+        self.current_token_index = 0
         self.session_headers = {
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
             'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
             'Accept-Language': 'en-US,en;q=0.9',
             'Accept-Encoding': 'gzip, deflate, br',
             'Connection': 'keep-alive',
-            'Upgrade-Insecure-Requests': '1'
+            'Upgrade-Insecure-Requests': '1',
+            'Origin': 'https://telegram.org',
+            'Referer': REPORT_URL
         }
 
     @staticmethod
@@ -93,79 +107,12 @@ class ReportBot:
             logger.error("message.txt not found!")
             return ["This channel violates Telegram's terms of service"]
 
-    async def get_csrf_token(self, session: aiohttp.ClientSession) -> str:
-        """Fetch CSRF token from the report page with retries and proper headers"""
-        headers = self.session_headers.copy()
-        headers.update({
-            'Sec-Fetch-Dest': 'document',
-            'Sec-Fetch-Mode': 'navigate',
-            'Sec-Fetch-Site': 'none',
-            'Sec-Fetch-User': '?1',
-            'Cache-Control': 'no-cache',
-            'Pragma': 'no-cache'
-        })
-
-        for attempt in range(3):  # Try 3 times
-            try:
-                async with session.get(
-                    REPORT_URL,
-                    headers=headers,
-                    timeout=aiohttp.ClientTimeout(total=15),
-                    allow_redirects=True,
-                    ssl=False
-                ) as response:
-                    if response.status != 200:
-                        logger.error(f"Failed to get CSRF token. Status: {response.status}, URL: {response.url}")
-                        await asyncio.sleep(1)
-                        continue
-
-                    text = await response.text()
-                    if not text:
-                        logger.error("Empty response received from report page")
-                        await asyncio.sleep(1)
-                        continue
-
-                    # Try different patterns to find the CSRF token
-                    soup = BeautifulSoup(text, 'html.parser')
-                    
-                    # Try method 1: Direct input field
-                    token = soup.find('input', {'name': 'csrf_token'})
-                    if token and token.get('value'):
-                        return token['value']
-                    
-                    # Try method 2: Meta tag
-                    meta_token = soup.find('meta', {'name': 'csrf-token'})
-                    if meta_token and meta_token.get('content'):
-                        return meta_token['content']
-                    
-                    # Try method 3: Data attribute
-                    data_token = soup.find(attrs={'data-csrf': True})
-                    if data_token and data_token.get('data-csrf'):
-                        return data_token['data-csrf']
-
-                    # Try method 4: Parse from script tags
-                    scripts = soup.find_all('script')
-                    for script in scripts:
-                        if script.string and 'csrf' in script.string.lower():
-                            import re
-                            csrf_match = re.search(r'csrf[_-]token["\']?\s*[:=]\s*["\']([^"\']+)', script.string, re.I)
-                            if csrf_match:
-                                return csrf_match.group(1)
-
-                    logger.error(f"No CSRF token found in the page. Response length: {len(text)}")
-                    logger.debug(f"Page content preview: {text[:500]}")
-                    await asyncio.sleep(1)
-
-            except asyncio.TimeoutError:
-                logger.error(f"Timeout while getting CSRF token (attempt {attempt + 1}/3)")
-            except aiohttp.ClientError as e:
-                logger.error(f"Network error while getting CSRF token: {str(e)} (attempt {attempt + 1}/3)")
-            except Exception as e:
-                logger.error(f"Unexpected error while getting CSRF token: {str(e)} (attempt {attempt + 1}/3)")
-            
-            await asyncio.sleep(2)
-        
-        return ""
+    def get_next_token(self) -> str:
+        """Get next CSRF token using round-robin"""
+        tokens = list(CSRF_TOKENS.values())
+        token = tokens[self.current_token_index]
+        self.current_token_index = (self.current_token_index + 1) % len(tokens)
+        return token
 
     async def report_with_proxy(self, channel: str, proxy: str, user_id: int) -> bool:
         """Submit a report using a specific proxy"""
@@ -189,6 +136,9 @@ class ReportBot:
                 cookie_jar=aiohttp.CookieJar(),
                 trust_env=True
             ) as session:
+                # Set session cookies
+                session.cookie_jar.update_cookies(SESSION_COOKIES)
+
                 # Test proxy connection first
                 try:
                     async with session.get('https://api.telegram.org', ssl=False) as test_response:
@@ -203,25 +153,20 @@ class ReportBot:
                     return False
 
                 # Get CSRF token
-                csrf_token = await self.get_csrf_token(session)
-                if not csrf_token:
-                    logger.error(f"Failed to get CSRF token with proxy {proxy}")
-                    return False
-
-                if user_id in self.active_tasks and self.active_tasks[user_id].get('cancelled', False):
-                    return False
+                csrf_token = self.get_next_token()
 
                 # Prepare report data
                 headers = self.session_headers.copy()
                 headers.update({
                     'Content-Type': 'application/x-www-form-urlencoded',
-                    'Origin': 'https://telegram.org',
-                    'Referer': REPORT_URL,
-                    'X-CSRF-Token': csrf_token
+                    'X-CSRF-Token': csrf_token,
+                    'X-CSRFToken': csrf_token,
+                    'Cookie': f'csrftoken={csrf_token}; sessionid={SESSION_COOKIES["sessionid"]}'
                 })
                 
                 form_data = {
                     'csrf_token': csrf_token,
+                    'csrfmiddlewaretoken': csrf_token,
                     'channel': channel,
                     'reason': random.choice(self.messages),
                     'submit': 'Report Channel'
