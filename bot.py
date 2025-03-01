@@ -4,7 +4,7 @@ import asyncio
 import random
 import re
 from datetime import datetime
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Set
 
 import aiohttp
 from aiohttp_socks import ProxyConnector
@@ -66,12 +66,14 @@ class ReportBot:
     def __init__(self):
         self.proxy_manager = ProxyManager()
         self.messages = self.load_messages()
+        self.active_tasks: Dict[int, Set[asyncio.Task]] = {}
         self.session_headers = {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
-            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
-            'Accept-Language': 'en-US,en;q=0.5',
-            'Origin': 'https://telegram.org',
-            'Referer': REPORT_URL
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
+            'Accept-Language': 'en-US,en;q=0.9',
+            'Accept-Encoding': 'gzip, deflate, br',
+            'Connection': 'keep-alive',
+            'Upgrade-Insecure-Requests': '1'
         }
 
     @staticmethod
@@ -85,32 +87,78 @@ class ReportBot:
             return ["This channel violates Telegram's terms of service"]
 
     async def get_csrf_token(self, session: aiohttp.ClientSession) -> str:
-        """Fetch CSRF token from the report page"""
-        try:
-            async with session.get(REPORT_URL, timeout=DEFAULT_TIMEOUT) as response:
-                if response.status != 200:
-                    return ""
-                text = await response.text()
-                soup = BeautifulSoup(text, 'html.parser')
-                token = soup.find('input', {'name': 'csrf_token'})
-                return token['value'] if token else ""
-        except Exception as e:
-            logger.error(f"Error getting CSRF token: {str(e)}")
-            return ""
+        """Fetch CSRF token from the report page with retries and proper headers"""
+        headers = self.session_headers.copy()
+        headers.update({
+            'Sec-Fetch-Dest': 'document',
+            'Sec-Fetch-Mode': 'navigate',
+            'Sec-Fetch-Site': 'none',
+            'Sec-Fetch-User': '?1',
+            'Cache-Control': 'max-age=0'
+        })
+
+        for attempt in range(3):  # Try 3 times
+            try:
+                async with session.get(
+                    REPORT_URL,
+                    headers=headers,
+                    timeout=DEFAULT_TIMEOUT,
+                    allow_redirects=True,
+                    ssl=False
+                ) as response:
+                    if response.status != 200:
+                        logger.error(f"Failed to get CSRF token. Status: {response.status}")
+                        continue
+
+                    text = await response.text()
+                    if not text:
+                        logger.error("Empty response received from report page")
+                        continue
+
+                    soup = BeautifulSoup(text, 'html.parser')
+                    token = soup.find('input', {'name': 'csrf_token'})
+                    
+                    if not token or not token.get('value'):
+                        logger.error("No CSRF token found in the page")
+                        continue
+
+                    return token['value']
+
+            except asyncio.TimeoutError:
+                logger.error(f"Timeout while getting CSRF token (attempt {attempt + 1}/3)")
+            except aiohttp.ClientError as e:
+                logger.error(f"Network error while getting CSRF token: {str(e)} (attempt {attempt + 1}/3)")
+            except Exception as e:
+                logger.error(f"Unexpected error while getting CSRF token: {str(e)} (attempt {attempt + 1}/3)")
+            
+            await asyncio.sleep(1)  # Wait before retry
+        
+        return ""
 
     async def report_with_proxy(self, channel: str, proxy: str) -> bool:
         """Submit a report using a specific proxy"""
         try:
             connector = ProxyConnector.from_url(proxy, verify_ssl=False)
-            async with aiohttp.ClientSession(connector=connector) as session:
+            timeout = aiohttp.ClientTimeout(total=DEFAULT_TIMEOUT)
+            
+            async with aiohttp.ClientSession(
+                connector=connector,
+                timeout=timeout,
+                cookie_jar=aiohttp.CookieJar()
+            ) as session:
                 # Get CSRF token
                 csrf_token = await self.get_csrf_token(session)
                 if not csrf_token:
+                    logger.error(f"Failed to get CSRF token with proxy {proxy}")
                     return False
 
                 # Prepare report data
                 headers = self.session_headers.copy()
-                headers['Content-Type'] = 'application/x-www-form-urlencoded'
+                headers.update({
+                    'Content-Type': 'application/x-www-form-urlencoded',
+                    'Origin': 'https://telegram.org',
+                    'Referer': REPORT_URL
+                })
                 
                 form_data = {
                     'csrf_token': csrf_token,
@@ -124,9 +172,15 @@ class ReportBot:
                     REPORT_URL,
                     headers=headers,
                     data=form_data,
-                    timeout=DEFAULT_TIMEOUT
+                    allow_redirects=True,
+                    ssl=False
                 ) as response:
-                    success = response.status == 200 and 'report has been sent' in (await response.text()).lower()
+                    response_text = await response.text()
+                    success = response.status == 200 and ('report has been sent' in response_text.lower() or 'thank you' in response_text.lower())
+                    if success:
+                        logger.info(f"Successfully reported channel using proxy {proxy}")
+                    else:
+                        logger.error(f"Failed to report channel. Status: {response.status}, Response: {response_text[:200]}")
                     self.proxy_manager.mark_proxy_status(proxy, success)
                     return success
 
@@ -135,36 +189,76 @@ class ReportBot:
             self.proxy_manager.mark_proxy_status(proxy, False)
             return False
 
-    async def mass_report(self, channel: str, num_reports: int = 50) -> str:
+    def cancel_user_tasks(self, user_id: int) -> int:
+        """Cancel all active tasks for a user"""
+        if user_id not in self.active_tasks:
+            return 0
+        
+        cancelled = 0
+        for task in self.active_tasks[user_id]:
+            if not task.done():
+                task.cancel()
+                cancelled += 1
+        
+        self.active_tasks[user_id].clear()
+        return cancelled
+
+    async def mass_report(self, channel: str, user_id: int, num_reports: int = 50) -> str:
         """Send multiple reports using different proxies"""
         if not self.proxy_manager.proxies:
             return "No proxies available! Please add proxies to http_proxies.txt"
 
+        if user_id in self.active_tasks and self.active_tasks[user_id]:
+            return "You already have an active reporting process. Use /cancel to stop it first."
+
         successful_reports = 0
         failed_reports = 0
         semaphore = asyncio.Semaphore(CONCURRENT_REPORTS)
+        self.active_tasks[user_id] = set()
 
         async def report_with_semaphore():
-            async with semaphore:
-                proxy = self.proxy_manager.get_proxy()
-                for _ in range(MAX_RETRIES):
-                    if await self.report_with_proxy(channel, proxy):
-                        return True
+            try:
+                async with semaphore:
+                    proxy = self.proxy_manager.get_proxy()
+                    for _ in range(MAX_RETRIES):
+                        if await self.report_with_proxy(channel, proxy):
+                            return True
+                    return False
+            except asyncio.CancelledError:
+                logger.info(f"Report task cancelled for user {user_id}")
+                raise
+            except Exception as e:
+                logger.error(f"Error in report task: {str(e)}")
                 return False
 
-        tasks = [report_with_semaphore() for _ in range(num_reports)]
-        results = await asyncio.gather(*tasks)
+        try:
+            tasks = [asyncio.create_task(report_with_semaphore()) for _ in range(num_reports)]
+            self.active_tasks[user_id].update(tasks)
+            
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+            
+            successful_reports = sum(1 for r in results if r is True)
+            failed_reports = sum(1 for r in results if r is False)
+            cancelled_reports = sum(1 for r in results if isinstance(r, asyncio.CancelledError))
 
-        successful_reports = sum(1 for r in results if r)
-        failed_reports = sum(1 for r in results if not r)
+            status = (
+                f"📊 Report Results:\n"
+                f"✅ Successful: {successful_reports}\n"
+                f"❌ Failed: {failed_reports}\n"
+            )
 
-        return (
-            f"📊 Report Results:\n"
-            f"✅ Successful: {successful_reports}\n"
-            f"❌ Failed: {failed_reports}\n"
-            f"📈 Success Rate: {(successful_reports/num_reports)*100:.1f}%\n"
-            f"🔄 Working Proxies: {len(self.proxy_manager.working_proxies)}"
-        )
+            if cancelled_reports:
+                status += f"🚫 Cancelled: {cancelled_reports}\n"
+
+            if successful_reports + failed_reports > 0:
+                success_rate = (successful_reports/(successful_reports + failed_reports))*100
+                status += f"📈 Success Rate: {success_rate:.1f}%\n"
+
+            status += f"🔄 Working Proxies: {len(self.proxy_manager.working_proxies)}"
+            return status
+
+        finally:
+            self.active_tasks[user_id].clear()
 
 # Initialize the bot
 report_bot = ReportBot()
@@ -180,7 +274,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "/help - Show available commands\n"
         "/echo [message] - Echo back your message\n"
         "/time - Get current time\n"
-        "/report [channel_link] - Report a Telegram channel"
+        "/report [channel_link] - Report a Telegram channel\n"
+        "/cancel - Cancel ongoing reporting process"
     )
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -191,7 +286,8 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         "/help - Show this help message\n"
         "/echo [message] - Echo back your message\n"
         "/time - Get current time\n"
-        "/report [channel_link] - Report a Telegram channel\n\n"
+        "/report [channel_link] - Report a Telegram channel\n"
+        "/cancel - Cancel ongoing reporting process\n\n"
         "For reporting, use format:\n"
         "/report https://t.me/channelname"
     )
@@ -217,6 +313,20 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         "I can respond to commands! Try /help to see what I can do."
     )
 
+async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Cancel ongoing reporting process."""
+    user_id = update.effective_user.id
+    cancelled = report_bot.cancel_user_tasks(user_id)
+    
+    if cancelled > 0:
+        await update.message.reply_text(
+            f"✅ Successfully cancelled {cancelled} active reporting tasks."
+        )
+    else:
+        await update.message.reply_text(
+            "❌ No active reporting process to cancel."
+        )
+
 async def report_channel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handle channel reporting."""
     if len(context.args) < 1:
@@ -241,10 +351,11 @@ async def report_channel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         channel_username = match.group(1)
         status_message = await update.message.reply_text(
             "🚀 Starting mass report process...\n"
-            "⏳ This may take a few minutes. Please wait..."
+            "⏳ This may take a few minutes. Please wait...\n"
+            "Use /cancel to stop the process."
         )
         
-        result = await report_bot.mass_report(channel_username)
+        result = await report_bot.mass_report(channel_username, update.effective_user.id)
         
         await status_message.edit_text(
             f"Channel: @{channel_username}\n\n{result}\n\n"
@@ -272,6 +383,7 @@ def main() -> None:
     application.add_handler(CommandHandler("echo", echo))
     application.add_handler(CommandHandler("time", time_command))
     application.add_handler(CommandHandler("report", report_channel))
+    application.add_handler(CommandHandler("cancel", cancel_command))
 
     # Handle non-command messages
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
