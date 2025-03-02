@@ -25,10 +25,13 @@ logger = logging.getLogger(__name__)
 
 # Constants
 CHANNEL_LINK_PATTERN = r'^(?:https?://)?(?:t\.me|telegram\.me)/(?:joinchat/)?([a-zA-Z0-9_-]+)$'
-MAX_RETRIES = 3
-CONCURRENT_REPORTS = 5  # Reduced to avoid detection
+MAX_RETRIES = 5  # Increased retries
+CONCURRENT_REPORTS = 15  # Increased concurrent reports
 DEFAULT_TIMEOUT = 30
 REPORT_URL = "https://telegram.org/dsa-report"
+REPORTS_PER_BATCH = 150  # Increased number of reports per batch
+MIN_DELAY = 1.0  # Minimum delay between requests
+MAX_DELAY = 3.0  # Maximum delay between requests
 
 # CSRF Token Configuration
 CSRF_TOKENS = {
@@ -41,11 +44,29 @@ SESSION_COOKIES = {
     'sessionid': 'jcl1bqxzby1c8pspe592y5ub55x01scm'
 }
 
-# Browser-like Headers
+# Browser-like Headers with more variety
+BROWSER_HEADERS = [
+    {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        'Accept-Language': 'en-US,en;q=0.9,de;q=0.8'
+    },
+    {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36 Edg/121.0.0.0',
+        'Accept-Language': 'en-GB,en;q=0.9,de;q=0.8'
+    },
+    {
+        'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.2.1 Safari/605.1.15',
+        'Accept-Language': 'fr-FR,fr;q=0.9,en-US;q=0.8,en;q=0.7'
+    },
+    {
+        'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        'Accept-Language': 'it-IT,it;q=0.9,en-US;q=0.8,en;q=0.7'
+    }
+]
+
+# Default headers that will be combined with browser headers
 DEFAULT_HEADERS = {
-    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
     'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
-    'Accept-Language': 'en-US,en;q=0.9,de;q=0.8',
     'Accept-Encoding': 'gzip, deflate, br',
     'Connection': 'keep-alive',
     'Upgrade-Insecure-Requests': '1',
@@ -80,6 +101,8 @@ class PhoneNumberManager:
         self.working_numbers = set()
         self.failed_numbers = set()
         self.current_index = 0
+        self.last_used_country = None
+        self.country_usage_count = {}
 
     @staticmethod
     def is_valid_number(number: str) -> bool:
@@ -124,6 +147,8 @@ class PhoneNumberManager:
         try:
             with open('phone_numbers.txt', 'r') as f:
                 numbers = []
+                numbers_by_country = {}
+                
                 for line in f:
                     line = line.strip()
                     if not line or line.startswith('#'):
@@ -131,6 +156,9 @@ class PhoneNumberManager:
                     if self.is_valid_number(line):
                         numbers.append(line)
                         country = self.get_country_code(line)
+                        if country not in numbers_by_country:
+                            numbers_by_country[country] = 0
+                        numbers_by_country[country] += 1
                         logger.info(f"Added {country} phone number: {line}")
                     else:
                         logger.debug(f"Invalid phone number format: {line}")
@@ -138,33 +166,55 @@ class PhoneNumberManager:
                 if not numbers:
                     logger.warning("No valid phone numbers found in phone_numbers.txt!")
                 else:
-                    logger.info(f"Loaded {len(numbers)} phone numbers")
+                    logger.info(f"Loaded {len(numbers)} phone numbers from {len(numbers_by_country)} countries")
+                    for country, count in numbers_by_country.items():
+                        logger.info(f"{country}: {count} numbers")
                 return numbers
         except FileNotFoundError:
             logger.error("phone_numbers.txt not found!")
             return []
 
     def get_phone_number(self) -> str:
-        """Get a working phone number"""
-        if self.working_numbers:
-            return random.choice(list(self.working_numbers))
+        """Get a working phone number with improved country rotation"""
         if not self.phone_numbers:
             logger.error("No phone numbers available!")
             return ""
-        
-        # Round-robin selection
-        number = self.phone_numbers[self.current_index]
-        self.current_index = (self.current_index + 1) % len(self.phone_numbers)
-        return number
+
+        # Group all available numbers by country
+        numbers_by_country = {}
+        for num in (self.working_numbers if self.working_numbers else self.phone_numbers):
+            country = self.get_country_code(num)
+            if country not in numbers_by_country:
+                numbers_by_country[country] = []
+            numbers_by_country[country].append(num)
+
+        available_countries = list(numbers_by_country.keys())
+        if not available_countries:
+            return random.choice(self.phone_numbers)
+
+        # Update country usage count
+        if self.last_used_country:
+            self.country_usage_count[self.last_used_country] = self.country_usage_count.get(self.last_used_country, 0) + 1
+
+        # Select country with least usage
+        selected_country = min(available_countries, key=lambda x: self.country_usage_count.get(x, 0))
+        self.last_used_country = selected_country
+
+        # Select random number from selected country
+        selected_number = random.choice(numbers_by_country[selected_country])
+        logger.debug(f"Selected number from country {selected_country}: {selected_number}")
+        return selected_number
 
     def mark_number_status(self, number: str, success: bool):
         """Mark phone number as working or failed"""
         if success:
             self.working_numbers.add(number)
             self.failed_numbers.discard(number)
+            logger.info(f"Marked {self.get_country_code(number)} number {number} as working")
         else:
             self.failed_numbers.add(number)
             self.working_numbers.discard(number)
+            logger.warning(f"Marked {self.get_country_code(number)} number {number} as failed")
 
 class ReportBot:
     def __init__(self):
@@ -172,13 +222,16 @@ class ReportBot:
         self.messages = self.load_messages()
         self.active_tasks: Dict[int, Dict[str, Any]] = {}
         self.current_token_index = 0
+        self.browser_header_index = 0
 
     @staticmethod
     def load_messages() -> List[str]:
         """Load report messages from message.txt"""
         try:
             with open('message.txt', 'r') as f:
-                return [line.strip() for line in f if line.strip() and not line.startswith('#')]
+                messages = [line.strip() for line in f if line.strip() and not line.startswith('#')]
+                logger.info(f"Loaded {len(messages)} report messages")
+                return messages
         except FileNotFoundError:
             logger.error("message.txt not found!")
             return [
@@ -194,9 +247,16 @@ class ReportBot:
         self.current_token_index = (self.current_token_index + 1) % len(tokens)
         return token
 
+    def get_next_browser_headers(self) -> Dict[str, str]:
+        """Get next browser headers using round-robin"""
+        headers = BROWSER_HEADERS[self.browser_header_index].copy()
+        self.browser_header_index = (self.browser_header_index + 1) % len(BROWSER_HEADERS)
+        return headers
+
     def prepare_headers(self, csrf_token: str) -> Dict[str, str]:
         """Prepare headers for the request"""
         headers = DEFAULT_HEADERS.copy()
+        headers.update(self.get_next_browser_headers())
         headers.update({
             'Content-Type': 'application/x-www-form-urlencoded',
             'Origin': 'https://telegram.org',
@@ -215,7 +275,7 @@ class ReportBot:
                 return False
 
             # Configure timeout
-            timeout = aiohttp.ClientTimeout(total=30, connect=10)
+            timeout = aiohttp.ClientTimeout(total=DEFAULT_TIMEOUT, connect=10)
             
             async with aiohttp.ClientSession(
                 timeout=timeout,
@@ -274,8 +334,8 @@ class ReportBot:
                                 else:
                                     submit_url = REPORT_URL
 
-                        # Add delay between GET and POST
-                        await asyncio.sleep(random.uniform(2.0, 4.0))
+                        # Add random delay between GET and POST
+                        await asyncio.sleep(random.uniform(MIN_DELAY, MAX_DELAY))
 
                         # Update headers for POST request
                         post_headers = headers.copy()
@@ -317,8 +377,8 @@ class ReportBot:
                             if success:
                                 logger.info(f"Successfully reported channel using number {phone_number}")
                                 self.phone_manager.mark_number_status(phone_number, True)
-                                # Add delay between successful reports
-                                await asyncio.sleep(random.uniform(3.0, 5.0))
+                                # Add random delay between successful reports
+                                await asyncio.sleep(random.uniform(MIN_DELAY, MAX_DELAY))
                                 return True
                             
                             # Log the actual response for debugging
@@ -327,7 +387,7 @@ class ReportBot:
                             logger.debug(f"Response text: {response_text[:500]}...")
                             
                             if attempt < 1:
-                                await asyncio.sleep(random.uniform(2.0, 4.0))
+                                await asyncio.sleep(random.uniform(MIN_DELAY, MAX_DELAY))
                                 continue
                             
                             logger.error(f"Failed to report channel with number {phone_number}. Status: {response.status}")
@@ -336,7 +396,7 @@ class ReportBot:
 
                     except asyncio.TimeoutError:
                         if attempt < 1:
-                            await asyncio.sleep(2)
+                            await asyncio.sleep(MIN_DELAY)
                             continue
                         logger.error(f"Timeout with number {phone_number}")
                         self.phone_manager.mark_number_status(phone_number, False)
@@ -344,7 +404,7 @@ class ReportBot:
                     
                     except Exception as e:
                         if attempt < 1:
-                            await asyncio.sleep(2)
+                            await asyncio.sleep(MIN_DELAY)
                             continue
                         logger.error(f"Error with number {phone_number}: {str(e)}")
                         self.phone_manager.mark_number_status(phone_number, False)
@@ -372,7 +432,7 @@ class ReportBot:
 
         return cancelled
 
-    async def mass_report(self, channel: str, user_id: int, num_reports: int = 50) -> str:
+    async def mass_report(self, channel: str, user_id: int, num_reports: int = REPORTS_PER_BATCH) -> str:
         """Send multiple reports using different phone numbers"""
         if not self.phone_manager.phone_numbers:
             return "No phone numbers available! Please add numbers to phone_numbers.txt"
@@ -405,7 +465,7 @@ class ReportBot:
                         # Get a new number for retry
                         phone_number = self.phone_manager.get_phone_number()
                         # Add delay between retries
-                        await asyncio.sleep(random.uniform(1.0, 2.0))
+                        await asyncio.sleep(random.uniform(MIN_DELAY, MAX_DELAY))
                     return False
             except asyncio.CancelledError:
                 logger.info(f"Report task cancelled for user {user_id}")
@@ -426,6 +486,12 @@ class ReportBot:
 
             duration = datetime.now() - self.active_tasks[user_id]['start_time']
             
+            # Count working numbers by country
+            working_by_country = {}
+            for num in self.phone_manager.working_numbers:
+                country = self.phone_manager.get_country_code(num)
+                working_by_country[country] = working_by_country.get(country, 0) + 1
+            
             status = (
                 f"📊 Report Results:\n"
                 f"✅ Successful: {successful_reports}\n"
@@ -439,10 +505,16 @@ class ReportBot:
                 success_rate = (successful_reports/(successful_reports + failed_reports))*100
                 status += f"📈 Success Rate: {success_rate:.1f}%\n"
 
-            status += (
-                f"🔄 Working Numbers: {len(self.phone_manager.working_numbers)}\n"
-                f"⏱ Duration: {duration.seconds}s"
-            )
+            status += f"🔄 Working Numbers: {len(self.phone_manager.working_numbers)}\n"
+            
+            # Add working numbers by country
+            if working_by_country:
+                status += "\n📱 Working Numbers by Country:\n"
+                for country, count in working_by_country.items():
+                    status += f"{country}: {count}\n"
+            
+            status += f"\n⏱ Duration: {duration.seconds}s"
+            
             return status
 
         finally:
@@ -540,7 +612,7 @@ async def report_channel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         channel_username = match.group(1)
         status_message = await update.message.reply_text(
             "🚀 Starting mass report process...\n"
-            "⏳ This may take a few minutes. Please wait...\n"
+            f"⏳ Will attempt {REPORTS_PER_BATCH} reports with {CONCURRENT_REPORTS} concurrent tasks...\n"
             "Use /cancel to stop the process."
         )
         
@@ -548,7 +620,8 @@ async def report_channel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         
         await status_message.edit_text(
             f"Channel: @{channel_username}\n\n{result}\n\n"
-            f"⏰ Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+            f"⏰ Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n"
+            "💡 Tip: Run the command again for more reports from different numbers."
         )
 
     except Exception as e:
