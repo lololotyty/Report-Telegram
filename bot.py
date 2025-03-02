@@ -53,8 +53,9 @@ DEFAULT_HEADERS = {
     'Sec-Fetch-Mode': 'navigate',
     'Sec-Fetch-Site': 'same-origin',
     'Sec-Fetch-User': '?1',
-    'Cache-Control': 'no-cache',
-    'Pragma': 'no-cache'
+    'Cache-Control': 'max-age=0',
+    'Pragma': 'no-cache',
+    'DNT': '1'
 }
 
 class PhoneNumberManager:
@@ -130,7 +131,11 @@ class ReportBot:
                 return [line.strip() for line in f if line.strip()]
         except FileNotFoundError:
             logger.error("message.txt not found!")
-            return ["This channel violates Telegram's terms of service"]
+            return [
+                "This channel violates DSA guidelines by spreading harmful content",
+                "This channel needs to be reviewed for policy violations",
+                "Channel contains inappropriate content that violates community standards"
+            ]
 
     def get_next_token(self) -> str:
         """Get next CSRF token using round-robin"""
@@ -174,22 +179,69 @@ class ReportBot:
                         csrf_token = self.get_next_token()
                         headers = self.prepare_headers(csrf_token)
                         
-                        # Prepare form data for DSA report
+                        # DSA Report form data
                         form_data = {
                             'csrf_token': csrf_token,
                             'csrfmiddlewaretoken': csrf_token,
-                            'phone_number': phone_number,
-                            'channel_username': channel,
-                            'report_reason': random.choice(self.messages),
-                            'additional_details': f"Report from {phone_number}",
-                            'contact_allowed': 'true',
-                            'country_code': '+49' if phone_number.startswith('+49') else '+91',
-                            'submit_report': 'Submit Report'
+                            'phone': phone_number.lstrip('+'),
+                            'channel': f"@{channel}",  # Add @ prefix
+                            'description': random.choice(self.messages),
+                            'email': f"{phone_number.lstrip('+').replace('+', '')}@gmail.com",
+                            'name': f"User {phone_number[-4:]}",
+                            'country': 'DE' if phone_number.startswith('+49') else 'IN',
+                            'language': 'en',
+                            'report_type': 'channel_report',
+                            'platform': 'telegram',
+                            'submit': 'Submit Report',
+                            'agree_terms': 'on',
+                            'can_contact': 'on'
                         }
 
-                        async with session.post(
+                        # First make a GET request to get any dynamic tokens
+                        async with session.get(
                             REPORT_URL,
                             headers=headers,
+                            ssl=False,
+                            timeout=aiohttp.ClientTimeout(total=15)
+                        ) as get_response:
+                            if get_response.status == 200:
+                                # Extract any dynamic tokens if needed
+                                page_content = await get_response.text()
+                                soup = BeautifulSoup(page_content, 'html.parser')
+                                
+                                # Update form data with any dynamic fields
+                                for hidden_input in soup.find_all('input', type='hidden'):
+                                    if hidden_input.get('name') and hidden_input.get('value'):
+                                        form_data[hidden_input['name']] = hidden_input['value']
+
+                                # Extract form action URL if different from default
+                                form = soup.find('form')
+                                if form and form.get('action'):
+                                    submit_url = form['action']
+                                    if not submit_url.startswith('http'):
+                                        submit_url = f"https://telegram.org{submit_url}"
+                                else:
+                                    submit_url = REPORT_URL
+
+                        # Add delay between GET and POST
+                        await asyncio.sleep(random.uniform(2.0, 4.0))
+
+                        # Update headers for POST request
+                        post_headers = headers.copy()
+                        post_headers.update({
+                            'Content-Type': 'application/x-www-form-urlencoded',
+                            'Origin': 'https://telegram.org',
+                            'Referer': REPORT_URL,
+                            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
+                            'Sec-Fetch-Site': 'same-origin',
+                            'Sec-Fetch-Mode': 'navigate',
+                            'Sec-Fetch-User': '?1',
+                            'Sec-Fetch-Dest': 'document'
+                        })
+
+                        async with session.post(
+                            submit_url,
+                            headers=post_headers,
                             data=form_data,
                             allow_redirects=True,
                             ssl=False,
@@ -197,20 +249,31 @@ class ReportBot:
                         ) as response:
                             response_text = await response.text()
                             
-                            # Check for successful report indicators
+                            # Success indicators
                             success = (
-                                response.status == 200 and
-                                ('report has been sent' in response_text.lower() or
-                                'thank you' in response_text.lower() or
-                                'report received' in response_text.lower())
+                                response.status in [200, 201, 302] or
+                                any(indicator in response_text.lower() for indicator in [
+                                    'success',
+                                    'thank',
+                                    'received',
+                                    'submitted',
+                                    'report has been sent',
+                                    'report received',
+                                    'we will review'
+                                ])
                             )
                             
                             if success:
                                 logger.info(f"Successfully reported channel using number {phone_number}")
                                 self.phone_manager.mark_number_status(phone_number, True)
                                 # Add delay between successful reports
-                                await asyncio.sleep(random.uniform(1.5, 3.0))
+                                await asyncio.sleep(random.uniform(3.0, 5.0))
                                 return True
+                            
+                            # Log the actual response for debugging
+                            logger.debug(f"Response status: {response.status}")
+                            logger.debug(f"Response headers: {dict(response.headers)}")
+                            logger.debug(f"Response text: {response_text[:500]}...")
                             
                             if attempt < 1:
                                 await asyncio.sleep(random.uniform(2.0, 4.0))
