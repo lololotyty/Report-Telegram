@@ -177,3 +177,6 @@ It has come to my attention that {username} is perpetrating scams and engaging i
 Urgent attention is needed as {username} is conducting illegal practices and exploiting Telegram for personal gain. Please take immediate action to address this issue.
 I am reporting {username} for their involvement in illegal activities and scamming behavior on Telegram. Your swift action is necessary to protect users.
 The user {username} is engaging in unlawful practices and defrauding others on Telegram. I urge support to take swift and decisive action against them.
+This channel violates DSA guidelines by spreading harmful content
+This channel needs to be reviewed for policy violations
+Channel contains inappropriate content that violates community standards
