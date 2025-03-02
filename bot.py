@@ -59,6 +59,22 @@ DEFAULT_HEADERS = {
 }
 
 class PhoneNumberManager:
+    # EU country codes and their corresponding country names
+    EU_COUNTRIES = {
+        '43': 'AT',  # Austria
+        '32': 'BE',  # Belgium
+        '45': 'DK',  # Denmark
+        '358': 'FI', # Finland
+        '33': 'FR',  # France
+        '49': 'DE',  # Germany
+        '353': 'IE', # Ireland
+        '39': 'IT',  # Italy
+        '31': 'NL',  # Netherlands
+        '48': 'PL',  # Poland
+        '34': 'ES',  # Spain
+        '46': 'SE',  # Sweden
+    }
+
     def __init__(self):
         self.phone_numbers = self.load_phone_numbers()
         self.working_numbers = set()
@@ -67,8 +83,41 @@ class PhoneNumberManager:
 
     @staticmethod
     def is_valid_number(number: str) -> bool:
-        """Check if the phone number is valid German or Indian"""
-        return bool(re.match(r'^\+(?:49|91)\d{10,12}$', number))
+        """Check if the phone number is valid EU or Indian"""
+        if not number.startswith('+'):
+            return False
+        
+        # Remove + prefix for checking
+        number = number[1:]
+        
+        # Check for Indian numbers
+        if number.startswith('91') and len(number) == 12:
+            return True
+            
+        # Check for EU numbers
+        for country_code in PhoneNumberManager.EU_COUNTRIES.keys():
+            if number.startswith(country_code):
+                remaining_digits = number[len(country_code):]
+                # Most EU mobile numbers are 9-10 digits after country code
+                if 9 <= len(remaining_digits) <= 10:
+                    return True
+        return False
+
+    def get_country_code(self, number: str) -> str:
+        """Get the country code for a phone number"""
+        if not number.startswith('+'):
+            return 'UN'  # Unknown
+            
+        number = number[1:]  # Remove + prefix
+        
+        if number.startswith('91'):
+            return 'IN'
+            
+        for code, country in self.EU_COUNTRIES.items():
+            if number.startswith(code):
+                return country
+                
+        return 'UN'  # Unknown
 
     def load_phone_numbers(self) -> List[str]:
         """Load phone numbers from phone_numbers.txt"""
@@ -81,7 +130,8 @@ class PhoneNumberManager:
                         continue
                     if self.is_valid_number(line):
                         numbers.append(line)
-                        logger.info(f"Added phone number: {line}")
+                        country = self.get_country_code(line)
+                        logger.info(f"Added {country} phone number: {line}")
                     else:
                         logger.debug(f"Invalid phone number format: {line}")
                 
@@ -128,7 +178,7 @@ class ReportBot:
         """Load report messages from message.txt"""
         try:
             with open('message.txt', 'r') as f:
-                return [line.strip() for line in f if line.strip()]
+                return [line.strip() for line in f if line.strip() and not line.startswith('#')]
         except FileNotFoundError:
             logger.error("message.txt not found!")
             return [
@@ -180,6 +230,7 @@ class ReportBot:
                         headers = self.prepare_headers(csrf_token)
                         
                         # DSA Report form data
+                        country_code = self.phone_manager.get_country_code(phone_number)
                         form_data = {
                             'csrf_token': csrf_token,
                             'csrfmiddlewaretoken': csrf_token,
@@ -188,7 +239,7 @@ class ReportBot:
                             'description': random.choice(self.messages),
                             'email': f"{phone_number.lstrip('+').replace('+', '')}@gmail.com",
                             'name': f"User {phone_number[-4:]}",
-                            'country': 'DE' if phone_number.startswith('+49') else 'IN',
+                            'country': country_code,
                             'language': 'en',
                             'report_type': 'channel_report',
                             'platform': 'telegram',
